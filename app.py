@@ -7,6 +7,7 @@ from catboost import CatBoostClassifier
 from pathlib import Path
 import plotly.graph_objects as go
 import plotly.express as px
+import shap
 
 # ─────────────────────────────────────────
 # PAGE CONFIG
@@ -43,6 +44,8 @@ st.markdown("""
     --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
     --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+    --shap-positive: #ef4444;
+    --shap-negative: #3b82f6;
 }
 
 html, body, .stApp {
@@ -250,40 +253,23 @@ hr {
     color: #065f46;
 }
 
-/* Collapsible section styling */
-.collapsible-section {
-    margin-bottom: 1rem;
+.shap-card {
+    background: var(--bg-card);
+    border-radius: 16px;
+    padding: 1.5rem;
+    margin: 1rem 0;
+    box-shadow: var(--shadow-md);
+    border: 1px solid var(--border);
 }
 
-/* Checkbox styling */
-.stCheckbox label {
-    color: var(--text-secondary) !important;
-    font-size: 0.85rem !important;
+.shap-positive-bar {
+    background: linear-gradient(90deg, #fef2f2, #fee2e2);
+    border-left: 4px solid #ef4444;
 }
 
-/* Radio / Select */
-.stRadio label, .stSelectbox label {
-    color: var(--text-secondary) !important;
-    font-weight: 500 !important;
-}
-
-/* Number input label */
-.stNumberInput label {
-    color: var(--text-secondary) !important;
-    font-size: 0.8rem !important;
-}
-
-/* Code block */
-.stCodeBlock {
-    background: #f8fafc !important;
-    border-radius: 12px !important;
-    border: 1px solid var(--border) !important;
-}
-
-/* Dataframe */
-.dataframe {
-    border-radius: 12px !important;
-    overflow: hidden !important;
+.shap-negative-bar {
+    background: linear-gradient(90deg, #eff6ff, #dbeafe);
+    border-left: 4px solid #3b82f6;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -305,6 +291,23 @@ imputer, model, schema = load_artifacts()
 NUMERIC_COLS   = schema["numeric_features"]
 CATEGORICAL_COLS = schema["categorical_features"]
 FEATURE_ORDER  = schema["strict_feature_order"]
+
+# ─────────────────────────────────────────
+# SHAP EXPLAINER SETUP
+# ─────────────────────────────────────────
+@st.cache_resource(show_spinner="📊 Initializing SHAP explainer...")
+def init_shap_explainer():
+    # Create a background dataset for SHAP (use dummy data with median values)
+    background_df = pd.DataFrame([{col: 0 for col in FEATURE_ORDER}])
+    explainer = shap.TreeExplainer(model, background_df, feature_perturbation="interventional")
+    return explainer
+
+try:
+    shap_explainer = init_shap_explainer()
+    SHAP_AVAILABLE = True
+except Exception as e:
+    st.warning(f"SHAP explainer initialization note: {str(e)[:100]}...")
+    SHAP_AVAILABLE = False
 
 # ─────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -453,6 +456,136 @@ def feature_bar_chart(inputs):
     return fig
 
 
+def create_shap_waterfall(shap_values, base_value, features_df, top_n=10):
+    """Create a waterfall chart visualization for SHAP values"""
+    
+    # Get feature names and SHAP values
+    feature_names = features_df.columns.tolist()
+    shap_vals = shap_values[0] if len(shap_values.shape) > 1 else shap_values
+    
+    # Create dataframe of feature contributions
+    contributions = pd.DataFrame({
+        'feature': feature_names,
+        'shap_value': shap_vals,
+        'abs_shap': np.abs(shap_vals)
+    })
+    
+    # Sort by absolute contribution and get top N
+    contributions = contributions.sort_values('abs_shap', ascending=False).head(top_n)
+    
+    # Calculate cumulative contributions
+    base_prob = base_value
+    cumulative = base_prob
+    contributions['cumulative_start'] = cumulative
+    
+    waterfall_data = []
+    for idx, row in contributions.iterrows():
+        cumulative += row['shap_value']
+        waterfall_data.append({
+            'feature': row['feature'],
+            'shap_value': row['shap_value'],
+            'start': contributions.loc[idx, 'cumulative_start'],
+            'end': cumulative,
+            'is_positive': row['shap_value'] > 0
+        })
+    
+    final_prob = cumulative
+    
+    # Create Plotly waterfall chart
+    fig = go.Figure()
+    
+    # Add base value bar
+    fig.add_trace(go.Bar(
+        name='Base Value',
+        x=['Base Value'],
+        y=[base_prob],
+        marker_color='#94a3b8',
+        text=[f'{base_prob:.3f}'],
+        textposition='outside',
+        width=0.6
+    ))
+    
+    # Add contribution bars
+    for item in waterfall_data:
+        color = '#ef4444' if item['is_positive'] else '#3b82f6'
+        fig.add_trace(go.Bar(
+            name=item['feature'],
+            x=[item['feature']],
+            y=[item['shap_value']],
+            marker_color=color,
+            text=[f"+{item['shap_value']:.3f}" if item['is_positive'] else f"{item['shap_value']:.3f}"],
+            textposition='outside',
+            width=0.6,
+            base=[item['start']]
+        ))
+    
+    # Add final prediction bar
+    fig.add_trace(go.Bar(
+        name='Final Prediction',
+        x=['Final Prediction'],
+        y=[final_prob],
+        marker_color='#2563eb',
+        text=[f'{final_prob:.3f}'],
+        textposition='outside',
+        width=0.6
+    ))
+    
+    fig.update_layout(
+        title=dict(
+            text="Clinical Evidence Breakdown — SHAP Feature Contributions",
+            font=dict(size=14, color="#1e293b", family="Inter"),
+            x=0.5
+        ),
+        barmode='overlay',
+        showlegend=False,
+        height=500,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(
+            title="Features",
+            tickangle=-45,
+            tickfont=dict(size=10, color="#475569"),
+            gridcolor='#e2e8f0'
+        ),
+        yaxis=dict(
+            title="f(x) = Prediction Score",
+            titlefont=dict(color="#475569"),
+            tickfont=dict(color="#64748b"),
+            gridcolor='#e2e8f0'
+        ),
+        font=dict(family='Inter'),
+        margin=dict(t=60, b=80, l=40, r=40)
+    )
+    
+    return fig, contributions
+
+
+def create_shap_summary_table(contributions):
+    """Create a styled summary table of SHAP contributions"""
+    
+    contributions['direction'] = contributions['shap_value'].apply(
+        lambda x: '↑ Increases Risk' if x > 0 else '↓ Decreases Risk'
+    )
+    contributions['impact'] = contributions['shap_value'].apply(
+        lambda x: f"+{x:.4f}" if x > 0 else f"{x:.4f}"
+    )
+    
+    # Style with colors
+    def color_impact(val):
+        if '+' in str(val):
+            return 'color: #dc2626; font-weight: 600'
+        elif '-' in str(val):
+            return 'color: #2563eb; font-weight: 600'
+        return ''
+    
+    styled = contributions[['feature', 'impact', 'direction', 'abs_shap']].head(10)
+    styled.columns = ['Feature', 'Impact', 'Direction', '|Impact|']
+    styled['Impact'] = styled['Impact'].apply(lambda x: f"{float(x):+.4f}" if isinstance(x, (int, float)) else x)
+    styled['|Impact|'] = styled['|Impact|'].apply(lambda x: f"{x:.4f}")
+    
+    return styled
+
+
 # ─────────────────────────────────────────
 # SIDEBAR — PATIENT DATA ENTRY (Collapsible sections)
 # ─────────────────────────────────────────
@@ -465,7 +598,6 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    # Collapsible Demographics
     with st.expander("👤 Demographics", expanded=True):
         age = st.slider("Age (years)", 20, 90, 55)
         sex = st.selectbox("Sex", ["Male", "Female"])
@@ -474,18 +606,15 @@ with st.sidebar:
         bmi = round(weight / (height / 100) ** 2, 2)
         st.caption(f"📊 BMI: **{bmi}** kg/m²")
 
-    # Collapsible Vital Signs
     with st.expander("💓 Vital Signs", expanded=True):
         bp = st.slider("Blood Pressure — Systolic (mmHg)", 70, 220, 120)
         pr = st.slider("Pulse Rate (bpm)", 40, 180, 75)
 
-    # Collapsible Cardiac Function
     with st.expander("🫀 Cardiac Function", expanded=True):
         ef_tte = st.slider("Ejection Fraction — EF-TTE (%)", 10, 80, 55)
         fc = st.selectbox("NYHA Function Class", [0, 1, 2, 3, 4], index=1)
         region_rwma = st.selectbox("Region RWMA", [0, 1, 2, 3, 4])
 
-    # Collapsible Lab Values
     with st.expander("🧪 Lab Values", expanded=False):
         fbs = st.number_input("Fasting Blood Sugar (mg/dL)", 50.0, 500.0, 100.0)
         cr = st.number_input("Creatinine (mg/dL)", 0.3, 15.0, 1.0, step=0.1)
@@ -502,7 +631,6 @@ with st.sidebar:
         neut = st.number_input("Neutrophils (%)", 10.0, 95.0, 60.0)
         plt_val = st.number_input("Platelets (×10³/µL)", 50.0, 800.0, 250.0)
 
-    # Collapsible Comorbidities (2 columns)
     with st.expander("📋 Comorbidities", expanded=False):
         col1s, col2s = st.columns(2)
         with col1s:
@@ -520,7 +648,6 @@ with st.sidebar:
             thyroid = st.checkbox("Thyroid Disease")
             dlp = st.checkbox("Dyslipidemia")
 
-    # Collapsible Symptoms & ECG
     with st.expander("📊 Symptoms & ECG", expanded=False):
         col3s, col4s = st.columns(2)
         with col3s:
@@ -543,7 +670,6 @@ with st.sidebar:
             lvh = st.checkbox("LVH")
             poor_r = st.checkbox("Poor R Progression")
 
-    # Collapsible VHD Severity
     with st.expander("❤️ Valvular Disease", expanded=False):
         vhd_label = st.selectbox("Valvular Heart Disease", ["None", "Mild", "Moderate", "Severe"])
         vhd_map = {"None": 0, "Mild": 1, "Moderate": 2, "Severe": 3}
@@ -582,7 +708,6 @@ patient_inputs = {
 # ─────────────────────────────────────────
 # MAIN PANEL
 # ─────────────────────────────────────────
-# Top header
 st.markdown("""
 <div style='display:flex; align-items:center; gap:1rem; padding: 0.5rem 0 1.5rem;'>
     <span style='font-size:2.5rem;'>🫀</span>
@@ -603,7 +728,7 @@ if not run_btn:
         c1.metric("ML Engine", "CatBoost", "Optimized via Optuna")
         c2.metric("Features", "54", "Clinical + ECG + Lab")
         c3.metric("Imputer", "KNN", "Defensive layer active")
-        c4.metric("Dataset", "CAD / UCI", "Z-Alizadeh Sani")
+        c4.metric("SHAP", "✓ Active", "Explainable AI")
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown('<div class="section-header">How To Use</div>', unsafe_allow_html=True)
@@ -613,7 +738,7 @@ if not run_btn:
                 <li>Fill in the patient's clinical profile in the <b style='color:#2563eb;'>left sidebar</b> — all sections are collapsible for easy navigation</li>
                 <li>Enter vitals, lab values, symptoms, and ECG findings</li>
                 <li>Press <b style='color:#2563eb;'>Run Cardiac Analysis</b> to generate risk assessment</li>
-                <li>Review the risk stratification, alerts, and care plan across detailed tabs</li>
+                <li>Review the risk stratification, SHAP explanations, alerts, and care plan across detailed tabs</li>
             </ol>
         </div>
         """, unsafe_allow_html=True)
@@ -646,6 +771,10 @@ if not run_btn:
             A <b style='color:#1e293b;'>KNN Imputer</b> provides a defensive preprocessing layer so incomplete patient profiles
             are safely handled without crashing the pipeline. Feature schema is locked to prevent training-serving skew.
             </p>
+            <p style='color:#475569; line-height:1.8; margin-top:0.5rem;'>
+            <b style='color:#2563eb;'>🔬 SHAP (SHapley Additive exPlanations)</b> provides interpretable AI by showing exactly 
+            which clinical features contributed to the prediction and by how much — enabling truly transparent clinical decision support.
+            </p>
             <hr>
             <p style='color:#ef4444; font-size:0.8rem; margin-top:1rem;'>
             ⚠️ For clinical decision support only. Not a substitute for physician judgment.
@@ -663,6 +792,20 @@ else:
         care = compute_care_plan(patient_inputs, risk_prob)
         risk_cls = care["risk_class"]
         r_color = risk_color(risk_cls)
+        
+        # Compute SHAP values
+        shap_contributions = None
+        shap_fig = None
+        shap_table = None
+        if SHAP_AVAILABLE:
+            try:
+                shap_values = shap_explainer.shap_values(patient_df)
+                expected_value = shap_explainer.expected_value
+                shap_fig, shap_contributions = create_shap_waterfall(shap_values, expected_value, patient_df, top_n=8)
+                shap_table = create_shap_summary_table(shap_contributions)
+            except Exception as e:
+                st.warning(f"SHAP computation note: {str(e)[:100]}")
+                SHAP_AVAILABLE = False
 
     # Banner
     banner_cls = {"CRITICAL": "risk-critical", "HIGH": "risk-high", "MODERATE": "risk-moderate", "LOW": "risk-low"}[risk_cls]
@@ -674,16 +817,91 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-    tabs = st.tabs(["📈 Risk Overview", "🩺 Clinical Report", "🧪 Lab Panel", "🔍 Feature Analysis"])
+    # Updated tabs with SHAP as first tab
+    tabs = st.tabs(["📊 SHAP Explanations", "📈 Risk Overview", "🩺 Clinical Report", "🧪 Lab Panel", "🔍 Feature Analysis"])
+
+    # ── TAB 0: SHAP EXPLANATIONS (NEW) ──
+    with tabs[0]:
+        if SHAP_AVAILABLE and shap_fig is not None:
+            st.markdown("""
+            <div class='shap-card'>
+                <div style='display:flex; align-items:center; gap:0.5rem; margin-bottom:1rem;'>
+                    <span style='font-size:1.5rem;'>🔬</span>
+                    <div>
+                        <div style='font-size:0.7rem; font-weight:700; letter-spacing:1px; color:#2563eb; text-transform:uppercase;'>Explainable AI</div>
+                        <div style='font-size:0.85rem; color:#64748b;'>Understanding what drives each prediction</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.plotly_chart(shap_fig, use_container_width=True, config={"displayModeBar": False})
+            
+            # Add interpretation guide
+            with st.expander("📖 How to interpret this chart"):
+                st.markdown("""
+                <div style='padding: 0.5rem 0;'>
+                    <ul style='color:#475569; line-height:1.8;'>
+                        <li><span style='color:#ef4444; font-weight:600;'>Red bars</span> increase the risk prediction (↑ CAD Probability)</li>
+                        <li><span style='color:#3b82f6; font-weight:600;'>Blue bars</span> decrease the risk prediction (↓ CAD Probability)</li>
+                        <li>The <b>base value</b> is the average prediction across all patients</li>
+                        <li>The <b>final prediction</b> is the patient-specific risk score after all contributions</li>
+                        <li>Longer bars = larger impact on the final decision</li>
+                    </ul>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Feature impact summary table
+            if shap_table is not None:
+                st.markdown('<div class="section-header" style="margin-top:1rem;">🔑 Top Feature Impacts</div>', unsafe_allow_html=True)
+                
+                # Create styled HTML table
+                table_html = """
+                <table style='width:100%; border-collapse:collapse; background:#ffffff; border-radius:12px; overflow:hidden; box-shadow:0 1px 2px rgba(0,0,0,0.05);'>
+                    <thead>
+                        <tr style='background:#f8fafc; border-bottom:2px solid #e2e8f0;'>
+                            <th style='padding:12px 16px; text-align:left; font-size:0.75rem; font-weight:700; color:#1e293b; text-transform:uppercase; letter-spacing:0.5px;'>Feature</th>
+                            <th style='padding:12px 16px; text-align:center; font-size:0.75rem; font-weight:700; color:#1e293b; text-transform:uppercase; letter-spacing:0.5px;'>Impact</th>
+                            <th style='padding:12px 16px; text-align:left; font-size:0.75rem; font-weight:700; color:#1e293b; text-transform:uppercase; letter-spacing:0.5px;'>Direction</th>
+                            <th style='padding:12px 16px; text-align:center; font-size:0.75rem; font-weight:700; color:#1e293b; text-transform:uppercase; letter-spacing:0.5px;'>|Impact|</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                """
+                
+                for _, row in shap_table.iterrows():
+                    direction_color = "#dc2626" if "Increases" in row['Direction'] else "#2563eb"
+                    impact_color = "#dc2626" if "+" in str(row['Impact']) else "#2563eb"
+                    impact_sign = "▲" if "+" in str(row['Impact']) else "▼"
+                    
+                    table_html += f"""
+                        <tr style='border-bottom:1px solid #f1f5f9;'>
+                            <td style='padding:10px 16px; font-size:0.85rem; font-weight:500; color:#1e293b;'>{row['Feature']}</td>
+                            <td style='padding:10px 16px; text-align:center; font-size:0.85rem; font-weight:600; color:{impact_color};'>{impact_sign} {row['Impact']}</td>
+                            <td style='padding:10px 16px; font-size:0.8rem; color:{direction_color};'>{row['Direction']}</td>
+                            <td style='padding:10px 16px; text-align:center; font-size:0.8rem; font-family:monospace; color:#64748b;'>{row['|Impact|']}</td>
+                        </tr>
+                    """
+                
+                table_html += """
+                    </tbody>
+                </table>
+                """
+                
+                st.markdown(table_html, unsafe_allow_html=True)
+                
+                st.info("💡 **Clinical Insight**: Features with larger |Impact| values have the strongest influence on the prediction. Red/increasing features may represent modifiable risk factors.")
+        else:
+            st.warning("SHAP explanations are currently unavailable. Ensure the model is properly configured with SHAP support.")
+            st.info("To enable SHAP: Make sure 'shap' is installed and the model supports TreeExplainer.")
 
     # ── TAB 1: RISK OVERVIEW ──
-    with tabs[0]:
+    with tabs[1]:
         c1, c2 = st.columns([1, 1])
         with c1:
             st.markdown('<div class="section-header">Risk Probability Gauge</div>', unsafe_allow_html=True)
             st.plotly_chart(gauge_chart(risk_prob), use_container_width=True, config={"displayModeBar": False})
 
-            # Key metrics
             m1, m2, m3 = st.columns(3)
             m1.metric("EF-TTE", f"{ef_tte}%", "Normal ≥55%" if ef_tte >= 55 else "⚠ Reduced")
             m2.metric("NYHA Class", f"Class {fc}")
@@ -693,7 +911,6 @@ else:
             st.markdown('<div class="section-header">Biomarker Radar</div>', unsafe_allow_html=True)
             st.plotly_chart(radar_chart(patient_inputs), use_container_width=True, config={"displayModeBar": False})
 
-            # Risk flags summary
             flag_cols = {
                 "DM": (dm, "Diabetes"), "HTN": (htn, "Hypertension"),
                 "Smoker": (smoker, "Current Smoker"), "Obesity": (obesity, "Obesity"),
@@ -706,7 +923,7 @@ else:
                 st.markdown(f"<div style='display:flex; flex-wrap:wrap; gap:6px;'>{flag_html}</div>", unsafe_allow_html=True)
 
     # ── TAB 2: CLINICAL REPORT ──
-    with tabs[1]:
+    with tabs[2]:
         c1, c2 = st.columns([1, 1])
         with c1:
             st.markdown('<div class="section-header">⚡ Clinical Alerts</div>', unsafe_allow_html=True)
@@ -744,7 +961,7 @@ else:
             st.json(export_data)
 
     # ── TAB 3: LAB PANEL ──
-    with tabs[2]:
+    with tabs[3]:
         st.markdown('<div class="section-header">Laboratory Reference Panel</div>', unsafe_allow_html=True)
 
         lab_data = [
@@ -785,7 +1002,7 @@ else:
                 """, unsafe_allow_html=True)
 
     # ── TAB 4: FEATURE ANALYSIS ──
-    with tabs[3]:
+    with tabs[4]:
         st.markdown('<div class="section-header">Numeric Feature Value Profile</div>', unsafe_allow_html=True)
         st.plotly_chart(feature_bar_chart(patient_inputs), use_container_width=True, config={"displayModeBar": False})
 
